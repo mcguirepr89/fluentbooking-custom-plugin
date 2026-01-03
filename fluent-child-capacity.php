@@ -2,7 +2,7 @@
 /**
  * Plugin Name: FluentBooking Child Capacity Limit
  * Description: Enforces max children per group event using booking questions
- * Version: 1.3.0
+ * Version: 1.3.2
  */
 
 if (!defined('ABSPATH')) {
@@ -12,14 +12,13 @@ if (!defined('ABSPATH')) {
 /* =========================
  * CONFIG
  * ========================= */
-define('FB_CHILD_LIMIT', 10);
-define('FB_LIMITED_EVENT_IDS', [8]); // Event IDs to enforce limit on
-define('FB_CHILD_FIELD_LABEL', 'children'); // match by keyword, not exact text
+const FB_CHILD_LIMIT = 10;
+const FB_LIMITED_EVENT_IDS = [8, 12]; // Event IDs to enforce limit on
 
 /* =========================
  * DEBUG LOGGER
  * ========================= */
-function fb_debug($label, $data = null) {
+function fb_child_limit_debug($label, $data = null) {
     error_log('FB CHILD LIMIT :: ' . $label);
     if ($data !== null) {
         error_log(print_r($data, true));
@@ -27,39 +26,58 @@ function fb_debug($label, $data = null) {
 }
 
 /* =========================
- * CHILD COUNT EXTRACTOR
+ * CHILD COUNT EXTRACTION
  * ========================= */
-function fb_get_children_count($meta) {
-    if (!is_array($meta)) {
-        return 0;
-    }
+function fb_child_limit_get_children_count(array $meta): int {
 
     foreach ($meta as $key => $value) {
 
-        // Match field key, not label
+        // Match the numeric "number of children" field by key
         if (stripos($key, 'number_of_children') !== false) {
 
-            fb_debug('MATCHED CHILD FIELD KEY', $key);
-            fb_debug('RAW CHILD FIELD VALUE', $value);
+            fb_child_limit_debug('MATCHED CHILD FIELD KEY', $key);
+            fb_child_limit_debug('RAW CHILD FIELD VALUE', $value);
 
-            return max(0, intval($value));
+            return max(0, (int) $value);
         }
     }
 
-    fb_debug('NO CHILD FIELD MATCH FOUND');
+    fb_child_limit_debug('NO CHILD FIELD FOUND');
     return 0;
 }
 
 /* =========================
- * ENFORCEMENT LOGIC
+ * FETCH EXISTING BOOKINGS
+ * ========================= */
+function fb_child_limit_get_overlapping_bookings($booking) {
+
+    global $wpdb;
+
+    return $wpdb->get_results($wpdb->prepare(
+        "
+        SELECT id
+        FROM {$wpdb->prefix}fcal_bookings
+        WHERE event_id = %d
+          AND start_time = %s
+          AND status IN ('scheduled','confirmed')
+          AND id != %d
+        ",
+        (int) $booking->event_id,
+        $booking->start_time,
+        (int) $booking->id
+    ));
+}
+
+/* =========================
+ * ENFORCEMENT
  * ========================= */
 add_action('fluent_booking/after_booking_meta_update', function ($booking) {
 
-    fb_debug('HOOK FIRED');
-    fb_debug('BOOKING ID', $booking->id);
-    fb_debug('EVENT ID', $booking->event_id);
-    fb_debug('START TIME', $booking->start_time);
-    fb_debug('STATUS (initial)', $booking->status);
+    fb_child_limit_debug('HOOK FIRED');
+    fb_child_limit_debug('BOOKING ID', $booking->id);
+    fb_child_limit_debug('EVENT ID', $booking->event_id);
+    fb_child_limit_debug('START TIME', $booking->start_time);
+    fb_child_limit_debug('STATUS (initial)', $booking->status);
 
     /* ---- Scope enforcement ---- */
     if (
@@ -69,20 +87,90 @@ add_action('fluent_booking/after_booking_meta_update', function ($booking) {
         return;
     }
 
-    /* ---- Current booking children ---- */
-    $meta = $booking->getMeta('custom_fields_data', []);
-    fb_debug('CUSTOM FIELDS DATA', $meta);
+    /* ---- Children for current booking ---- */
+    $meta = (array) $booking->getMeta('custom_fields_data', []);
+    fb_child_limit_debug('CUSTOM FIELDS DATA', $meta);
 
-    $childrenThisBooking = fb_get_children_count($meta);
-    fb_debug('CHILDREN THIS BOOKING', $childrenThisBooking);
+    $children_this_booking = fb_child_limit_get_children_count($meta);
+    fb_child_limit_debug('CHILDREN THIS BOOKING', $children_this_booking);
 
-    if ($childrenThisBooking <= 0) {
+    if ($children_this_booking <= 0) {
+        return;
+    }
+
+    /* ---- Sum existing children ---- */
+    $total_children = $children_this_booking;
+
+    $rows = fb_child_limit_get_overlapping_bookings($booking);
+    fb_child_limit_debug('OVERLAPPING BOOKINGS (excluding current)', $rows);
+
+    foreach ($rows as $row) {
+
+        $existing_booking = \FluentBooking\App\Models\Booking::find($row->id);
+        if (!$existing_booking) {
+            continue;
+        }
+
+        $existing_meta = (array) $existing_booking->getMeta('custom_fields_data', []);
+        $existing_children = fb_child_limit_get_children_count($existing_meta);
+
+        fb_child_limit_debug('EXISTING BOOKING ID', $row->id);
+        fb_child_limit_debug('EXISTING CHILDREN', $existing_children);
+
+        $total_children += $existing_children;
+    }
+
+    fb_child_limit_debug('TOTAL CHILDREN FINAL', $total_children);
+    fb_child_limit_debug('CHILD LIMIT', FB_CHILD_LIMIT);
+
+    /* ---- Enforce ---- */
+    if ($total_children > FB_CHILD_LIMIT) {
+    
+        fb_child_limit_debug('LIMIT EXCEEDED — CANCELLING BOOKING');
+    
+        $already_booked = $total_children - $children_this_booking;
+        $remaining = max(0, FB_CHILD_LIMIT - $already_booked);
+    
+        // Cancel booking (hard enforcement)
+        $booking->status = 'cancelled';
+        $booking->save();
+    
+        // Send frontend-friendly error
+        wp_send_json_error([
+            'message' => sprintf(
+                __(
+                    'This event can accommodate up to %d children. %d spot(s) remain, but you attempted to register %d child(ren). Please adjust the number or choose another date.',
+                    'fluent-booking'
+                ),
+                FB_CHILD_LIMIT,
+                $remaining,
+                $children_this_booking
+	    ),
+        ], 400);
+    }
+
+
+}, 10, 1);
+
+add_action('fluent_booking/before_booking', function ($bookingData) {
+
+    // Scope: only target group events we care about
+    if (
+        empty($bookingData['event_type']) ||
+        $bookingData['event_type'] !== 'group' ||
+        empty($bookingData['event_id']) ||
+        !in_array((int) $bookingData['event_id'], FB_LIMITED_EVENT_IDS, true)
+    ) {
+        return;
+    }
+
+    if (empty($bookingData['start_time'])) {
         return;
     }
 
     global $wpdb;
 
-    /* ---- Fetch OTHER bookings for same slot ---- */
+    /* ---- Fetch existing bookings for this slot ---- */
     $rows = $wpdb->get_results($wpdb->prepare(
         "
         SELECT id
@@ -90,47 +178,32 @@ add_action('fluent_booking/after_booking_meta_update', function ($booking) {
         WHERE event_id = %d
           AND start_time = %s
           AND status IN ('scheduled','confirmed')
-          AND id != %d
         ",
-        $booking->event_id,
-        $booking->start_time,
-        $booking->id
+        (int) $bookingData['event_id'],
+        $bookingData['start_time']
     ));
 
-    fb_debug('OVERLAPPING BOOKINGS (excluding current)', $rows);
-
-    $totalChildren = $childrenThisBooking;
+    $totalChildren = 0;
 
     foreach ($rows as $row) {
-        $bBooking = \FluentBooking\App\Models\Booking::find($row->id);
-        if (!$bBooking) {
+        $existingBooking = \FluentBooking\App\Models\Booking::find($row->id);
+        if (!$existingBooking) {
             continue;
         }
 
-        $bMeta = $bBooking->getMeta('custom_fields_data', []);
-        $existingChildren = fb_get_children_count($bMeta);
-
-        fb_debug('EXISTING BOOKING ID', $row->id);
-        fb_debug('EXISTING CHILDREN', $existingChildren);
-
-        $totalChildren += $existingChildren;
+        $meta = $existingBooking->getMeta('custom_fields_data', []);
+        $totalChildren += fb_child_limit_get_children_count($meta);
     }
 
-    fb_debug('TOTAL CHILDREN FINAL', $totalChildren);
-    fb_debug('CHILD LIMIT', FB_CHILD_LIMIT);
+    /* ---- Enforce hard capacity ---- */
+    if ($totalChildren >= FB_CHILD_LIMIT) {
 
-    /* ---- Enforce limit ---- */
-    if ($totalChildren > FB_CHILD_LIMIT) {
-        fb_debug('LIMIT EXCEEDED — CANCELLING BOOKING');
-
-        $booking->status = 'cancelled';
-        $booking->save();
-
-        wp_die(
-            __('Sorry, this event has reached the maximum number of children (10).', 'fluent-booking'),
-            __('Booking Unavailable', 'fluent-booking'),
-            ['response' => 400]
-        );
+        wp_send_json_error([
+            'message' => __(
+                'This event has reached its maximum number of children and is now fully booked.',
+                'fluent-booking'
+            )
+        ], 400);
     }
 
 }, 10, 1);
