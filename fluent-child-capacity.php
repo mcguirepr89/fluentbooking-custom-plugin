@@ -2,7 +2,7 @@
 /**
  * Plugin Name: FluentBooking Child Capacity Limit
  * Description: Enforces max children per group event using booking questions
- * Version: 1.3.2
+ * Version: 1.3.1
  */
 
 if (!defined('ABSPATH')) {
